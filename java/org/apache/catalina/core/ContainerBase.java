@@ -276,7 +276,8 @@ public abstract class ContainerBase extends LifecycleMBeanBase
      * children associated with this container.
      */
     private int startStopThreads = 1;
-    protected ThreadPoolExecutor startStopExecutor;
+
+    private StartStopHandler startStopHandler;
 
 
     // ------------------------------------------------------------- Properties
@@ -286,38 +287,11 @@ public abstract class ContainerBase extends LifecycleMBeanBase
         return startStopThreads;
     }
 
-    /**
-     * Handles the special values.
-     */
-    private int getStartStopThreadsInternal() {
-        int result = getStartStopThreads();
-
-        // Positive values are unchanged
-        if (result > 0) {
-            return result;
-        }
-
-        // Zero == Runtime.getRuntime().availableProcessors()
-        // -ve  == Runtime.getRuntime().availableProcessors() + value
-        // These two are the same
-        result = Runtime.getRuntime().availableProcessors() + result;
-        if (result < 1) {
-            result = 1;
-        }
-        return result;
-    }
-
     @Override
     public void setStartStopThreads(int startStopThreads) {
         this.startStopThreads = startStopThreads;
 
-        // Use local copies to ensure thread safety
-        ThreadPoolExecutor executor = startStopExecutor;
-        if (executor != null) {
-            int newThreads = getStartStopThreadsInternal();
-            executor.setMaximumPoolSize(newThreads);
-            executor.setCorePoolSize(newThreads);
-        }
+        this.startStopHandler = StartStopHandler.createStartStopHandler(getName(), startStopThreads);
     }
 
 
@@ -893,13 +867,7 @@ public abstract class ContainerBase extends LifecycleMBeanBase
 
     @Override
     protected void initInternal() throws LifecycleException {
-        BlockingQueue<Runnable> startStopQueue = new LinkedBlockingQueue<>();
-        startStopExecutor = new ThreadPoolExecutor(
-                getStartStopThreadsInternal(),
-                getStartStopThreadsInternal(), 10, TimeUnit.SECONDS,
-                startStopQueue,
-                new StartStopThreadFactory(getName() + "-startStop-"));
-        startStopExecutor.allowCoreThreadTimeOut(true);
+        this.startStopHandler = StartStopHandler.createStartStopHandler(getName(), getStartStopThreads());
         super.initInternal();
     }
 
@@ -927,26 +895,7 @@ public abstract class ContainerBase extends LifecycleMBeanBase
         }
 
         // Start our child containers, if any
-        Container children[] = findChildren();
-        List<Future<Void>> results = new ArrayList<>();
-        for (int i = 0; i < children.length; i++) {
-            results.add(startStopExecutor.submit(new StartChild(children[i])));
-        }
-
-        boolean fail = false;
-        for (Future<Void> result : results) {
-            try {
-                result.get();
-            } catch (Exception e) {
-                log.error(sm.getString("containerBase.threadedStartFailed"), e);
-                fail = true;
-            }
-
-        }
-        if (fail) {
-            throw new LifecycleException(
-                    sm.getString("containerBase.threadedStartFailed"));
-        }
+        startStopHandler.start(findChildren());
 
         // Start the Valves in our pipeline (including the basic), if any
         if (pipeline instanceof Lifecycle)
@@ -983,25 +932,7 @@ public abstract class ContainerBase extends LifecycleMBeanBase
         }
 
         // Stop our child containers, if any
-        Container children[] = findChildren();
-        List<Future<Void>> results = new ArrayList<>();
-        for (int i = 0; i < children.length; i++) {
-            results.add(startStopExecutor.submit(new StopChild(children[i])));
-        }
-
-        boolean fail = false;
-        for (Future<Void> result : results) {
-            try {
-                result.get();
-            } catch (Exception e) {
-                log.error(sm.getString("containerBase.threadedStopFailed"), e);
-                fail = true;
-            }
-        }
-        if (fail) {
-            throw new LifecycleException(
-                    sm.getString("containerBase.threadedStopFailed"));
-        }
+        startStopHandler.stop(findChildren());
 
         // Stop our subordinate components, if any
         Realm realm = getRealmInternal();
@@ -1042,8 +973,8 @@ public abstract class ContainerBase extends LifecycleMBeanBase
         }
 
         // If init fails, this may be null
-        if (startStopExecutor != null) {
-            startStopExecutor.shutdownNow();
+        if (startStopHandler != null) {
+            startStopHandler.stop();
         }
 
         super.destroyInternal();
